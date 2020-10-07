@@ -17,6 +17,7 @@ package user
 import (
 	"context"
 	"net/http"
+	"strings"
 
 	"github.com/google/exposure-notifications-verification-server/pkg/controller"
 	"github.com/google/exposure-notifications-verification-server/pkg/database"
@@ -63,10 +64,11 @@ func (c *Controller) HandleCreate() http.Handler {
 			c.renderNew(ctx, w)
 			return
 		}
+		email := strings.TrimSpace(form.Email)
 
 		// See if the user already exists by email - they may be a member of another
 		// realm.
-		user, err := c.db.FindUserByEmail(form.Email)
+		user, err := c.db.FindUserByEmail(email)
 		if err != nil {
 			if !database.IsNotFound(err) {
 				controller.InternalError(w, r, c.h, err)
@@ -74,21 +76,14 @@ func (c *Controller) HandleCreate() http.Handler {
 			}
 
 			user = new(database.User)
-			user.Email = form.Email
+			user.Email = email
 			user.Name = form.Name
 		}
 
 		// Create firebase user first, if this fails we don't want a db.User entry
-		if created, err := user.CreateFirebaseUser(ctx, c.client); err != nil {
-			flash.Alert("Failed to create user: %v", err)
+		if _, err := c.createFirebaseUser(ctx, user); err != nil {
 			c.renderNew(ctx, w)
 			return
-		} else if created {
-			if err := c.firebaseInternal.SendPasswordResetEmail(ctx, user.Email); err != nil {
-				flash.Error("Failed sending new user invitation: %v", err)
-				c.renderNew(ctx, w)
-				return
-			}
 		}
 
 		// Build the user struct

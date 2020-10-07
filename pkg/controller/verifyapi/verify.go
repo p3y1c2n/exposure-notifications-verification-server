@@ -35,12 +35,11 @@ import (
 
 	"github.com/dgrijalva/jwt-go"
 	"go.opencensus.io/stats"
-	"go.opencensus.io/tag"
 )
 
 func (c *Controller) HandleVerify() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx := r.Context()
+		ctx := observability.WithBuildInfo(r.Context())
 
 		authApp := controller.AuthorizedAppFromContext(ctx)
 		if authApp == nil {
@@ -48,23 +47,14 @@ func (c *Controller) HandleVerify() http.Handler {
 			return
 		}
 
-		// This is a non terminal error, as we're only using the realm for stats.
-		realm, err := authApp.Realm(c.db)
-		if err != nil {
-			c.logger.Errorf("unable to load realm", "error", err)
-		} else {
-			ctx, err = tag.New(ctx,
-				tag.Upsert(observability.RealmTagKey, realm.Name))
-			if err != nil {
-				c.logger.Errorw("unable to record metrics for realm", "realmID", realm.ID, "error", err)
-			}
-		}
-		stats.Record(ctx, c.metrics.CodeVerifyAttempts.M(1))
+		ctx = observability.WithRealmID(ctx, authApp.RealmID)
+
+		stats.Record(ctx, mCodeVerifyAttempts.M(1))
 
 		var request api.VerifyCodeRequest
 		if err := controller.BindJSON(w, r, &request); err != nil {
 			c.logger.Errorw("bad request", "error", err)
-			stats.Record(ctx, c.metrics.CodeVerificationError.M(1))
+			stats.Record(ctx, mCodeVerificationError.M(1))
 			c.h.RenderJSON(w, http.StatusBadRequest, api.Error(err).WithCode(api.ErrUnparsableRequest))
 			return
 		}
@@ -73,7 +63,7 @@ func (c *Controller) HandleVerify() http.Handler {
 		signer, err := c.kms.NewSigner(ctx, c.config.TokenSigning.ActiveKey())
 		if err != nil {
 			c.logger.Errorw("failed to get signer", "error", err)
-			stats.Record(ctx, c.metrics.CodeVerificationError.M(1))
+			stats.Record(ctx, mCodeVerificationError.M(1))
 			c.h.RenderJSON(w, http.StatusInternalServerError, api.InternalError())
 			return
 		}
@@ -82,7 +72,7 @@ func (c *Controller) HandleVerify() http.Handler {
 		acceptTypes, err := request.GetAcceptedTestTypes()
 		if err != nil {
 			c.logger.Errorf("invalid accept test types", "error", err)
-			stats.Record(ctx, c.metrics.CodeVerificationError.M(1))
+			stats.Record(ctx, mCodeVerificationError.M(1))
 			c.h.RenderJSON(w, http.StatusBadRequest, api.Error(err).WithCode(api.ErrInvalidTestType))
 			return
 		}
@@ -93,20 +83,20 @@ func (c *Controller) HandleVerify() http.Handler {
 		if err != nil {
 			switch {
 			case errors.Is(err, database.ErrVerificationCodeExpired):
-				stats.Record(ctx, c.metrics.CodeVerifyExpired.M(1), c.metrics.CodeVerificationError.M(1))
+				stats.Record(ctx, mCodeVerifyExpired.M(1), mCodeVerificationError.M(1))
 				c.h.RenderJSON(w, http.StatusBadRequest, api.Errorf("verification code expired").WithCode(api.ErrVerifyCodeExpired))
 			case errors.Is(err, database.ErrVerificationCodeUsed):
-				stats.Record(ctx, c.metrics.CodeVerifyCodeUsed.M(1), c.metrics.CodeVerificationError.M(1))
+				stats.Record(ctx, mCodeVerifyCodeUsed.M(1), mCodeVerificationError.M(1))
 				c.h.RenderJSON(w, http.StatusBadRequest, api.Errorf("verification code invalid").WithCode(api.ErrVerifyCodeInvalid))
 			case errors.Is(err, database.ErrVerificationCodeNotFound):
-				stats.Record(ctx, c.metrics.CodeVerifyInvalid.M(1), c.metrics.CodeVerificationError.M(1))
+				stats.Record(ctx, mCodeVerifyInvalid.M(1), mCodeVerificationError.M(1))
 				c.h.RenderJSON(w, http.StatusBadRequest, api.Errorf("verification code invalid").WithCode(api.ErrVerifyCodeInvalid))
 			case errors.Is(err, database.ErrUnsupportedTestType):
-				stats.Record(ctx, c.metrics.CodeVerifyInvalid.M(1), c.metrics.CodeVerificationError.M(1))
+				stats.Record(ctx, mCodeVerifyInvalid.M(1), mCodeVerificationError.M(1))
 				c.h.RenderJSON(w, http.StatusPreconditionFailed, api.Errorf("verification code has unsupported test type").WithCode(api.ErrUnsupportedTestType))
 			default:
 				c.logger.Errorw("failed to issue verification token", "error", err)
-				stats.Record(ctx, c.metrics.CodeVerificationError.M(1))
+				stats.Record(ctx, mCodeVerificationError.M(1))
 				c.h.RenderJSON(w, http.StatusInternalServerError, api.InternalError())
 			}
 			return
@@ -126,13 +116,13 @@ func (c *Controller) HandleVerify() http.Handler {
 		token.Header[verifyapi.KeyIDHeader] = c.config.TokenSigning.ActiveKeyID()
 		signedJWT, err := jwthelper.SignJWT(token, signer)
 		if err != nil {
-			stats.Record(ctx, c.metrics.CodeVerificationError.M(1))
+			stats.Record(ctx, mCodeVerificationError.M(1))
 			c.logger.Errorw("failed to sign token", "error", err)
 			c.h.RenderJSON(w, http.StatusBadRequest, api.Error(err).WithCode(api.ErrInternal))
 			return
 		}
 
-		stats.Record(ctx, c.metrics.CodeVerified.M(1))
+		stats.Record(ctx, mCodeVerified.M(1))
 		c.h.RenderJSON(w, http.StatusOK, api.VerifyCodeResponse{
 			TestType:          verificationToken.TestType,
 			SymptomDate:       verificationToken.FormatSymptomDate(),

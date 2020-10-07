@@ -31,7 +31,6 @@ import (
 	"github.com/google/exposure-notifications-verification-server/pkg/sms"
 
 	"go.opencensus.io/stats"
-	"go.opencensus.io/tag"
 )
 
 // Cache the UTC time.Location, to speed runtime.
@@ -81,14 +80,14 @@ func (c *Controller) HandleIssue() http.Handler {
 	logger := c.logger.Named("issueapi.HandleIssue")
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx := r.Context()
+		ctx := observability.WithBuildInfo(r.Context())
 
 		// Record the issue attempt.
-		stats.Record(ctx, c.metrics.IssueAttempts.M(1))
+		stats.Record(ctx, mIssueAttempts.M(1))
 
 		var request api.IssueCodeRequest
 		if err := controller.BindJSON(w, r, &request); err != nil {
-			stats.Record(ctx, c.metrics.CodeIssueErrors.M(1))
+			stats.Record(ctx, mCodeIssueErrors.M(1))
 			c.h.RenderJSON(w, http.StatusBadRequest, api.Error(err))
 			return
 		}
@@ -100,7 +99,7 @@ func (c *Controller) HandleIssue() http.Handler {
 
 		authApp, user, err := c.getAuthorizationFromContext(r)
 		if err != nil {
-			stats.Record(ctx, c.metrics.CodeIssueErrors.M(1))
+			stats.Record(ctx, mCodeIssueErrors.M(1))
 			c.h.RenderJSON(w, http.StatusUnauthorized, api.Error(err))
 			return
 		}
@@ -109,7 +108,7 @@ func (c *Controller) HandleIssue() http.Handler {
 		if authApp != nil {
 			realm, err = authApp.Realm(c.db)
 			if err != nil {
-				stats.Record(ctx, c.metrics.CodeIssueErrors.M(1))
+				stats.Record(ctx, mCodeIssueErrors.M(1))
 				c.h.RenderJSON(w, http.StatusUnauthorized, nil)
 				return
 			}
@@ -118,20 +117,17 @@ func (c *Controller) HandleIssue() http.Handler {
 			realm = controller.RealmFromContext(ctx)
 		}
 		if realm == nil {
-			stats.Record(ctx, c.metrics.IssueAttempts.M(1), c.metrics.CodeIssueErrors.M(1))
+			stats.Record(ctx, mIssueAttempts.M(1), mCodeIssueErrors.M(1))
 			c.h.RenderJSON(w, http.StatusBadRequest, api.Errorf("missing realm"))
 			return
 		}
 
 		// Add realm so that metrics are groupable on a per-realm basis.
-		ctx, err = tag.New(ctx, tag.Upsert(observability.RealmTagKey, fmt.Sprintf("%d", realm.ID)))
-		if err != nil {
-			logger.Errorw("unable to record metrics for realm", "realmID", realm.ID, "error", err)
-		}
+		ctx = observability.WithRealmID(ctx, realm.ID)
 
 		// If this realm requires a date but no date was specified, return an error.
 		if request.SymptomDate == "" && realm.RequireDate {
-			stats.Record(ctx, c.metrics.IssueAttempts.M(1), c.metrics.CodeIssueErrors.M(1))
+			stats.Record(ctx, mIssueAttempts.M(1), mCodeIssueErrors.M(1))
 			c.h.RenderJSON(w, http.StatusBadRequest, api.Errorf("missing either test or symptom date").WithCode(api.ErrMissingDate))
 			return
 		}
@@ -139,7 +135,7 @@ func (c *Controller) HandleIssue() http.Handler {
 		// Validate that the request with the provided test type is valid for this
 		// realm.
 		if !realm.ValidTestType(request.TestType) {
-			stats.Record(ctx, c.metrics.CodeIssueErrors.M(1))
+			stats.Record(ctx, mCodeIssueErrors.M(1))
 			c.h.RenderJSON(w, http.StatusBadRequest,
 				api.Errorf("unsupported test type: %v", request.TestType))
 			return
@@ -151,13 +147,13 @@ func (c *Controller) HandleIssue() http.Handler {
 			smsProvider, err = realm.SMSProvider(c.db)
 			if err != nil {
 				logger.Errorw("failed to get sms provider", "error", err)
-				stats.Record(ctx, c.metrics.CodeIssueErrors.M(1))
+				stats.Record(ctx, mCodeIssueErrors.M(1))
 				c.h.RenderJSON(w, http.StatusInternalServerError, api.Errorf("failed to get sms provider"))
 				return
 			}
 			if smsProvider == nil {
 				err := fmt.Errorf("phone provided, but no sms provider is configured")
-				stats.Record(ctx, c.metrics.CodeIssueErrors.M(1))
+				stats.Record(ctx, mCodeIssueErrors.M(1))
 				c.h.RenderJSON(w, http.StatusBadRequest, api.Error(err))
 				return
 			}
@@ -166,7 +162,7 @@ func (c *Controller) HandleIssue() http.Handler {
 		// Verify the test type
 		request.TestType = strings.ToLower(request.TestType)
 		if _, ok := c.validTestType[request.TestType]; !ok {
-			stats.Record(ctx, c.metrics.CodeIssueErrors.M(1))
+			stats.Record(ctx, mCodeIssueErrors.M(1))
 			c.h.RenderJSON(w, http.StatusBadRequest, api.Errorf("invalid test type"))
 			return
 		}
@@ -174,7 +170,7 @@ func (c *Controller) HandleIssue() http.Handler {
 		var symptomDate *time.Time
 		if request.SymptomDate != "" {
 			if parsed, err := time.Parse("2006-01-02", request.SymptomDate); err != nil {
-				stats.Record(ctx, c.metrics.CodeIssueErrors.M(1))
+				stats.Record(ctx, mCodeIssueErrors.M(1))
 				c.h.RenderJSON(w, http.StatusBadRequest, api.Errorf("failed to process symptom onset date: %v", err))
 				return
 			} else {
@@ -189,37 +185,41 @@ func (c *Controller) HandleIssue() http.Handler {
 						maxDate.Format("2006-01-02"),
 						parsed.Format("2006-01-02"),
 					)
-					stats.Record(ctx, c.metrics.CodeIssueErrors.M(1))
+					stats.Record(ctx, mCodeIssueErrors.M(1))
 					c.h.RenderJSON(w, http.StatusBadRequest, api.Error(err))
 					return
 				}
 			}
 		}
 
-		// If we got this far, we're about to issue a code.
-		dig, err := digest.HMACUint(realm.ID, c.config.GetRateLimitConfig().HMACKey)
-		if err != nil {
-			controller.InternalError(w, r, c.h, err)
-			return
-		}
-		key := fmt.Sprintf("realm:quota:%s", dig)
-		limit, remaining, reset, ok, err := c.limiter.Take(ctx, key)
-		if err != nil {
-			logger.Errorw("failed to take from limiter", "error", err)
-			stats.Record(ctx, c.metrics.QuotaErrors.M(1))
-			c.h.RenderJSON(w, http.StatusInternalServerError, api.Errorf("failed to verify realm stats, please try again"))
-			return
-		}
-		if !ok {
-			logger.Warnw("realm has exceeded daily quota",
-				"realm", realm.ID,
-				"limit", limit,
-				"reset", reset)
-			stats.Record(ctx, c.metrics.QuotaExceeded.M(1))
-
-			if c.config.GetEnforceRealmQuotas() {
-				c.h.RenderJSON(w, http.StatusTooManyRequests, api.Errorf("exceeded realm quota"))
+		// If we got this far, we're about to issue a code - take from the limiter
+		// to ensure this is permitted.
+		if realm.AbusePreventionEnabled {
+			dig, err := digest.HMACUint(realm.ID, c.config.GetRateLimitConfig().HMACKey)
+			if err != nil {
+				controller.InternalError(w, r, c.h, err)
 				return
+			}
+			key := fmt.Sprintf("realm:quota:%s", dig)
+			limit, remaining, reset, ok, err := c.limiter.Take(ctx, key)
+			c.recordCapacity(ctx, limit, remaining)
+			if err != nil {
+				logger.Errorw("failed to take from limiter", "error", err)
+				stats.Record(ctx, mQuotaErrors.M(1))
+				c.h.RenderJSON(w, http.StatusInternalServerError, api.Errorf("failed to verify realm stats, please try again"))
+				return
+			}
+			if !ok {
+				logger.Warnw("realm has exceeded daily quota",
+					"realm", realm.ID,
+					"limit", limit,
+					"reset", reset)
+				stats.Record(ctx, mQuotaExceeded.M(1))
+
+				if c.config.GetEnforceRealmQuotas() {
+					c.h.RenderJSON(w, http.StatusTooManyRequests, api.Errorf("exceeded realm quota"))
+					return
+				}
 			}
 		}
 
@@ -250,12 +250,10 @@ func (c *Controller) HandleIssue() http.Handler {
 		code, longCode, uuid, err := codeRequest.Issue(ctx, c.config.GetCollisionRetryCount())
 		if err != nil {
 			logger.Errorw("failed to issue code", "error", err)
-			stats.Record(ctx, c.metrics.CodeIssueErrors.M(1))
+			stats.Record(ctx, mCodeIssueErrors.M(1))
 			c.h.RenderJSON(w, http.StatusInternalServerError, api.Errorf("failed to generate otp code, please try again"))
 			return
 		}
-
-		c.recordCapacity(ctx, realm, remaining)
 
 		if request.Phone != "" && smsProvider != nil {
 			message := realm.BuildSMSText(code, longCode, c.config.GetENXRedirectDomain())
@@ -267,14 +265,14 @@ func (c *Controller) HandleIssue() http.Handler {
 				}
 
 				logger.Errorw("failed to send sms", "error", err)
-				stats.Record(ctx, c.metrics.CodeIssueErrors.M(1), c.metrics.SMSSendErrors.M(1))
+				stats.Record(ctx, mCodeIssueErrors.M(1), mSMSSendErrors.M(1))
 				c.h.RenderJSON(w, http.StatusInternalServerError, api.Errorf("failed to send sms"))
 				return
 			}
-			stats.Record(ctx, c.metrics.SMSSent.M(1))
+			stats.Record(ctx, mSMSSent.M(1))
 		}
 
-		stats.Record(ctx, c.metrics.CodesIssued.M(1))
+		stats.Record(ctx, mCodesIssued.M(1))
 		c.h.RenderJSON(w, http.StatusOK,
 			&api.IssueCodeResponse{
 				UUID:                   uuid,
@@ -291,25 +289,21 @@ func (c *Controller) getAuthorizationFromContext(r *http.Request) (*database.Aut
 	ctx := r.Context()
 
 	authorizedApp := controller.AuthorizedAppFromContext(ctx)
-	user := controller.UserFromContext(ctx)
+	currentUser := controller.UserFromContext(ctx)
 
-	if authorizedApp == nil && user == nil {
+	if authorizedApp == nil && currentUser == nil {
 		return nil, nil, fmt.Errorf("unable to identify authorized requestor")
 	}
 
-	return authorizedApp, user, nil
+	return authorizedApp, currentUser, nil
 }
 
-func (c *Controller) recordCapacity(ctx context.Context, realm *database.Realm, remaining uint64) {
-	if !realm.AbusePreventionEnabled {
-		return
-	}
-	stats.Record(ctx, c.metrics.RealmTokenRemaining.M(int64(remaining)))
+func (c *Controller) recordCapacity(ctx context.Context, limit, remaining uint64) {
+	stats.Record(ctx, mRealmTokenRemaining.M(int64(remaining)))
 
-	limit := realm.AbusePreventionEffectiveLimit()
 	issued := uint64(limit) - remaining
-	stats.Record(ctx, c.metrics.RealmTokenIssued.M(int64(issued)))
+	stats.Record(ctx, mRealmTokenIssued.M(int64(issued)))
 
 	capacity := float64(issued) / float64(limit)
-	stats.Record(ctx, c.metrics.RealmTokenCapacity.M(capacity))
+	stats.Record(ctx, mRealmTokenCapacity.M(capacity))
 }

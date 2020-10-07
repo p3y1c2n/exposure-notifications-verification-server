@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package database
+package controller
 
 import (
 	"github.com/google/exposure-notifications-verification-server/pkg/observability"
@@ -23,18 +23,18 @@ import (
 	"go.opencensus.io/stats/view"
 )
 
-const metricPrefix = observability.MetricRoot + "/database"
+const metricPrefix = observability.MetricRoot + "/server/login"
 
 var (
-	mAuditEntryCreated = stats.Int64(metricPrefix+"/audit_entry_created", "The number of times an audit entry was created", stats.UnitDimensionless)
+	MFirebaseRecreates = stats.Int64(metricPrefix+"/fb_recreates", "firebase user recreates", stats.UnitDimensionless)
 )
 
 func init() {
 	enobservability.CollectViews([]*view.View{
 		{
-			Name:        metricPrefix + "/audit_entry_created_count",
-			Measure:     mAuditEntryCreated,
-			Description: "The count of the number of audit entries created",
+			Name:        metricPrefix + "/fb_recreate_count",
+			Measure:     MFirebaseRecreates,
+			Description: "The count of firebase user recreations",
 			TagKeys:     observability.CommonTagKeys(),
 			Aggregation: view.Count(),
 		},

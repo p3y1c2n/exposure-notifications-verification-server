@@ -31,6 +31,7 @@ var (
 	shortCodeMinutes            = []int{}
 	longCodeLengths             = []int{12, 13, 14, 15, 16}
 	longCodeHours               = []int{}
+	mfaGracePeriod              = []int64{0, 1, 7, 30}
 	passwordRotationPeriodDays  = []int{0, 30, 60, 90, 365}
 	passwordRotationWarningDays = []int{0, 1, 3, 5, 7, 30}
 )
@@ -69,6 +70,7 @@ func (c *Controller) HandleSettings() http.Handler {
 
 		Security                    bool   `form:"security"`
 		MFAMode                     int16  `form:"mfa_mode"`
+		MFARequiredGracePeriod      int64  `form:"mfa_grace_period"`
 		EmailVerifiedMode           int16  `form:"email_verified_mode"`
 		PasswordRotationPeriodDays  uint   `form:"password_rotation_period_days"`
 		PasswordRotationWarningDays uint   `form:"password_rotation_warning_days"`
@@ -104,15 +106,31 @@ func (c *Controller) HandleSettings() http.Handler {
 			return
 		}
 
+		var quotaLimit, quotaRemaining uint64
+		if realm.AbusePreventionEnabled {
+			dig, err := digest.HMACUint(realm.ID, c.config.RateLimit.HMACKey)
+			if err != nil {
+				controller.InternalError(w, r, c.h, err)
+				return
+			}
+			key := fmt.Sprintf("realm:quota:%s", dig)
+
+			quotaLimit, quotaRemaining, err = c.limiter.Get(ctx, key)
+			if err != nil {
+				controller.InternalError(w, r, c.h, err)
+				return
+			}
+		}
+
 		if r.Method == http.MethodGet {
-			c.renderSettings(ctx, w, r, realm, nil)
+			c.renderSettings(ctx, w, r, realm, nil, quotaLimit, quotaRemaining)
 			return
 		}
 
 		var form FormData
 		if err := controller.BindForm(w, r, &form); err != nil {
 			flash.Error("Failed to process form: %v", err)
-			c.renderSettings(ctx, w, r, realm, nil)
+			c.renderSettings(ctx, w, r, realm, nil, quotaLimit, quotaRemaining)
 			return
 		}
 
@@ -148,6 +166,7 @@ func (c *Controller) HandleSettings() http.Handler {
 		if form.Security {
 			realm.EmailVerifiedMode = database.AuthRequirement(form.EmailVerifiedMode)
 			realm.MFAMode = database.AuthRequirement(form.MFAMode)
+			realm.MFARequiredGracePeriod = database.FromDuration(time.Duration(form.MFARequiredGracePeriod) * 24 * time.Hour)
 			realm.PasswordRotationPeriodDays = form.PasswordRotationPeriodDays
 			realm.PasswordRotationWarningDays = form.PasswordRotationWarningDays
 
@@ -155,7 +174,7 @@ func (c *Controller) HandleSettings() http.Handler {
 			if err != nil {
 				realm.AddError("allowedCIDRsAdminAPI", err.Error())
 				flash.Error("Failed to update realm")
-				c.renderSettings(ctx, w, r, realm, nil)
+				c.renderSettings(ctx, w, r, realm, nil, quotaLimit, quotaRemaining)
 				return
 			}
 			realm.AllowedCIDRsAdminAPI = allowedCIDRsAdminADPI
@@ -164,7 +183,7 @@ func (c *Controller) HandleSettings() http.Handler {
 			if err != nil {
 				realm.AddError("allowedCIDRsAPIServer", err.Error())
 				flash.Error("Failed to update realm")
-				c.renderSettings(ctx, w, r, realm, nil)
+				c.renderSettings(ctx, w, r, realm, nil, quotaLimit, quotaRemaining)
 				return
 			}
 			realm.AllowedCIDRsAPIServer = allowedCIDRsAPIServer
@@ -173,22 +192,49 @@ func (c *Controller) HandleSettings() http.Handler {
 			if err != nil {
 				realm.AddError("allowedCIDRsServer", err.Error())
 				flash.Error("Failed to update realm")
-				c.renderSettings(ctx, w, r, realm, nil)
+				c.renderSettings(ctx, w, r, realm, nil, quotaLimit, quotaRemaining)
 				return
 			}
 			realm.AllowedCIDRsServer = allowedCIDRsServer
 		}
 
 		// Abuse prevention
+		var abusePreventionJustEnabled bool
 		if form.AbusePrevention {
+			abusePreventionJustEnabled = !realm.AbusePreventionEnabled && form.AbusePreventionEnabled
+
 			realm.AbusePreventionEnabled = form.AbusePreventionEnabled
 			realm.AbusePreventionLimitFactor = form.AbusePreventionLimitFactor
+		}
+
+		// If abuse prevention was just enabled, create the initial bucket so
+		// enforcement works. We do this before actually saving the configuration on
+		// the realm to avoid a race where someone is issuing a code where abuse
+		// prevention has been enabled, but the quota has not been set. In that
+		// case, the quota would be the "default" quota for the limiter, which is
+		// not ideal or correct.
+		//
+		// Even if saving the realm fails, there's no harm in doing this early. It's
+		// an idempotent operation that TTLs out after a week anyway.
+		if abusePreventionJustEnabled {
+			dig, err := digest.HMACUint(realm.ID, c.config.RateLimit.HMACKey)
+			if err != nil {
+				controller.InternalError(w, r, c.h, err)
+				return
+			}
+			key := fmt.Sprintf("realm:quota:%s", dig)
+			limit := uint64(realm.AbusePreventionEffectiveLimit())
+			ttl := 7 * 24 * time.Hour
+			if err := c.limiter.Set(ctx, key, limit, ttl); err != nil {
+				controller.InternalError(w, r, c.h, err)
+				return
+			}
 		}
 
 		// Save realm
 		if err := c.db.SaveRealm(realm, currentUser); err != nil {
 			flash.Error("Failed to update realm: %v", err)
-			c.renderSettings(ctx, w, r, realm, nil)
+			c.renderSettings(ctx, w, r, realm, nil, quotaLimit, quotaRemaining)
 			return
 		}
 
@@ -210,7 +256,7 @@ func (c *Controller) HandleSettings() http.Handler {
 
 				if err := c.db.SaveSMSConfig(smsConfig); err != nil {
 					flash.Error("Failed to update realm: %v", err)
-					c.renderSettings(ctx, w, r, realm, smsConfig)
+					c.renderSettings(ctx, w, r, realm, smsConfig, quotaLimit, quotaRemaining)
 					return
 				}
 			} else {
@@ -226,7 +272,7 @@ func (c *Controller) HandleSettings() http.Handler {
 
 				if err := c.db.SaveSMSConfig(smsConfig); err != nil {
 					flash.Error("Failed to update realm: %v", err)
-					c.renderSettings(ctx, w, r, realm, smsConfig)
+					c.renderSettings(ctx, w, r, realm, smsConfig, quotaLimit, quotaRemaining)
 					return
 				}
 			}
@@ -253,7 +299,7 @@ func (c *Controller) HandleSettings() http.Handler {
 	})
 }
 
-func (c *Controller) renderSettings(ctx context.Context, w http.ResponseWriter, r *http.Request, realm *database.Realm, smsConfig *database.SMSConfig) {
+func (c *Controller) renderSettings(ctx context.Context, w http.ResponseWriter, r *http.Request, realm *database.Realm, smsConfig *database.SMSConfig, quotaLimit, quotaRemaining uint64) {
 	if smsConfig == nil {
 		var err error
 		smsConfig, err = realm.SMSConfig(c.db)
@@ -267,7 +313,7 @@ func (c *Controller) renderSettings(ctx context.Context, w http.ResponseWriter, 
 	}
 
 	// Don't pass through the system config to the template - we don't want to
-	// risk accidentially rendering its ID or values since the realm should never
+	// risk accidentally rendering its ID or values since the realm should never
 	// see these values. However, we have to go lookup the actual SMS config
 	// values if present so that if the user unchecks the form, they don't see
 	// blank values if they were previously using their own SMS configs.
@@ -297,6 +343,7 @@ func (c *Controller) renderSettings(ctx context.Context, w http.ResponseWriter, 
 		"negative":  database.TestTypeConfirmed | database.TestTypeLikely | database.TestTypeNegative,
 	}
 	// Valid settings for pwd rotation.
+	m["mfaGracePeriod"] = mfaGracePeriod
 	m["passwordRotateDays"] = passwordRotationPeriodDays
 	m["passwordWarnDays"] = passwordRotationWarningDays
 	// Valid settings for code parameters.
@@ -305,5 +352,9 @@ func (c *Controller) renderSettings(ctx context.Context, w http.ResponseWriter, 
 	m["longCodeLengths"] = longCodeLengths
 	m["longCodeHours"] = longCodeHours
 	m["enxRedirectDomain"] = c.config.GetENXRedirectDomain()
+
+	m["quotaLimit"] = quotaLimit
+	m["quotaRemaining"] = quotaRemaining
+
 	c.h.RenderHTML(w, "realmadmin/edit", m)
 }

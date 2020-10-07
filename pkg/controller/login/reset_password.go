@@ -19,10 +19,12 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/google/exposure-notifications-verification-server/internal/firebase"
 	"github.com/google/exposure-notifications-verification-server/pkg/controller"
 	"github.com/google/exposure-notifications-verification-server/pkg/controller/flash"
+	"go.opencensus.io/stats"
 )
 
 func (c *Controller) HandleShowResetPassword() http.Handler {
@@ -55,7 +57,20 @@ func (c *Controller) HandleSubmitResetPassword() http.Handler {
 			return
 		}
 
-		if err := c.firebaseInternal.SendPasswordResetEmail(ctx, form.Email); err != nil {
+		// Ensure that if we have a user, they have auth
+		if user, err := c.db.FindUserByEmail(form.Email); err == nil {
+			if created, _ := user.CreateFirebaseUser(ctx, c.client); created {
+				stats.Record(ctx, controller.MFirebaseRecreates.M(1))
+			}
+		}
+
+		if err := c.firebaseInternal.SendPasswordResetEmail(ctx, strings.TrimSpace(form.Email)); err != nil {
+			if errors.Is(err, firebase.ErrTooManyAttempts) {
+				flash.Error("Too many attempts have been made. Please wait and try again later.")
+				c.renderResetPassword(ctx, w, flash)
+				return
+			}
+
 			// Treat not-found like success so we don't leak details.
 			if !errors.Is(err, firebase.ErrEmailNotFound) {
 				flash.Error("Password reset failed.")
